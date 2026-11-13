@@ -71,41 +71,41 @@ The service is built as a **durable, crash-resilient workflow engine** centered 
 ```mermaid
 flowchart TD
     subgraph Storage ["Durable State Store (SQLite WAL)"]
-        DB[(dispatcher.db)]
-        DND[(Global DND Numbers)]
+        DB[("dispatcher.db")]
+        DND[("Global DND Numbers")]
     end
 
     subgraph DispatcherService ["Dispatcher Engine"]
-        Clock[ProviderClock Local Calc]
-        Scheduler[Scheduler & Window Math]
-        Reconciler[Active Call Reconciler]
-        Dialer[Concurrent Dialer Loop]
+        Clock["ProviderClock (Local Calculation)"]
+        Scheduler["Scheduler (Window Math & Priority)"]
+        Reconciler["Active Call Reconciler"]
+        Dialer["Concurrent Dialer Loop"]
     end
 
     subgraph Telephony ["External Telephony Provider (:8099)"]
-        API[Provider API POST /v1/calls]
-        CarrierClock[GET /v1/clock]
-        Report[/admin/report & /admin/leads]
+        API["Provider API (POST /v1/calls)"]
+        CarrierClock["Carrier Clock (GET /v1/clock)"]
+        Report["Admin Endpoints (/admin/report)"]
     end
 
     subgraph WebhookIngestion ["FastAPI Webhook Server (:8200)"]
-        Receiver[POST /webhooks/telephony]
-        HMAC[HMAC-SHA256 Signature Validator]
+        Receiver["Webhook Endpoint (/webhooks/telephony)"]
+        HMAC["HMAC-SHA256 Signature Validator"]
     end
 
     %% Flow connections
-    CarrierClock -->|One-time Sync| Clock
+    CarrierClock -->|Initial Sync| Clock
     Clock -.->|Simulated Now| Scheduler
     DB <-->|Atomic Reservation & Update| Scheduler
     Scheduler -->|Eligible Candidates| Dialer
     Dialer -->|Deterministic request_id| API
-    API -->|Async Call Result Webhook| Receiver
+    API -->|Call Result Webhook| Receiver
     Receiver -->|Verify Secret| HMAC
-    HMAC -->|Idempotent Update & Trigger Next Tier| DB
-    Reconciler -->|Poll in-flight / Catch lost ~3%| API
+    HMAC -->|Idempotent Update & Next Tier| DB
+    Reconciler -->|Poll In-Flight Calls| API
     Reconciler -->|Sync Ended Calls| DB
     DB -->|Cascade Blocked Leads| DND
-    DB -->|Output Contract| CSV[final_state.csv]
+    DB -->|Output Contract| CSV["final_state.csv"]
 ```
 
 ### Core Architecture Components:
@@ -135,21 +135,23 @@ A lead transitions through deterministic lifecycle states according to rules R1â
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending: Initial Import (CSV Fixtures)
+    [*] --> pending: Initial Import from CSV
 
-    pending --> dialing: Candidate Selected & Atomically Reserved<br/>(Validates Concurrency, Phone Locks, Window)
+    pending --> dialing: Candidate Selected and Atomically Reserved
     
-    dialing --> active: Provider Accepted (201 / 200)<br/>or Ambiguous 504 Verified via GET ?request_id
-    dialing --> pending: Provider Rejected (503)<br/>or 504 Verified Unplaced (Attempt Not Counted)
-    dialing --> dnd_blocked: Phone placed on DND by another lead while dialing
+    dialing --> active: Provider Accepted (201 or 200)
+    dialing --> active: Ambiguous 504 Verified via GET
+    dialing --> pending: Provider Rejected (503)
+    dialing --> pending: 504 Verified Unplaced (Attempt Uncounted)
+    dialing --> dnd_blocked: Phone placed on DND by another lead
 
-    active --> completed: Terminal Disposition Reached<br/>(interested, not_interested, wrong_number, dnd)
-    active --> exhausted: Non-terminal ended & attempts >= 3
-    active --> pending: Non-terminal ended & attempts < 3<br/>(Scheduled: busy/no_answer +60m, failed +15m, callback_at)
+    active --> completed: Terminal Disposition Reached
+    active --> exhausted: Non-Terminal Ended and Attempts Maxed
+    active --> pending: Non-Terminal Ended and Retries Remaining
     
-    active --> dnd_blocked: Precedence fallback if not terminal/exhausted
+    active --> dnd_blocked: Precedence Fallback
     
-    pending --> dnd_blocked: Global DND triggered from another lead sharing same phone
+    pending --> dnd_blocked: Global DND Triggered from Shared Phone
     
     completed --> [*]
     exhausted --> [*]
@@ -174,42 +176,42 @@ To ensure we never double-dial a customer even under high chaos or crashes, ever
 sequenceDiagram
     autonumber
     participant D as Dispatcher Engine
-    participant DB as SQLite (WAL)
+    participant DB as SQLite (WAL Mode)
     participant C as Provider Client
-    participant P as Mock Carrier API (:8099)
-    participant W as Webhook Receiver (:8200)
+    participant P as Mock Carrier API
+    participant W as Webhook Receiver
 
-    D->>DB: BEGIN IMMEDIATE: Select & reserve lead
-    DB-->>D: Lead marked 'dialing' with deterministic request_id
+    D->>DB: BEGIN IMMEDIATE: Select and reserve lead
+    DB-->>D: Lead marked dialing with deterministic request_id
     D->>C: place_call(request_id, phone, lead_id)
     C->>P: POST /v1/calls (Idempotency Key: request_id)
     
     alt Happy Path (201 Created)
         P-->>C: 201 Created (call_sid: CA...)
         C-->>D: CallAccepted(call_sid)
-        D->>DB: UPDATE leads & calls SET status='active'
+        D->>DB: UPDATE leads and calls SET status=active
     else Transient 503
         P-->>C: 503 Service Unavailable
         C-->>D: CallRejected503
-        D->>DB: Reset lead status='pending' (Attempt count unchanged)
+        D->>DB: Reset lead status=pending (Attempt uncounted)
     else Ambiguous 504 Gateway Timeout
         P-->>C: 504 Gateway Timeout
         Note over C,P: Ambiguity Resolution
-        C->>P: GET /v1/calls?request_id=...
+        C->>P: GET /v1/calls with request_id
         alt Call Exists on Provider (200 OK)
             P-->>C: 200 OK (call_sid: CA...)
             C-->>D: CallAccepted(call_sid)
-            D->>DB: UPDATE leads SET status='active'
+            D->>DB: UPDATE leads SET status=active
         else Call Not Found (404)
             P-->>C: 404 Not Found
             C-->>D: CallUnplaced
-            D->>DB: Reset lead status='pending' (Attempt count unchanged)
+            D->>DB: Reset lead status=pending (Attempt uncounted)
         end
     end
 
     opt Call Outcome Processing (Webhook or Reconciler)
         P->>W: POST /webhooks/telephony (Signed HMAC-SHA256)
-        W->>DB: Idempotently record outcome & schedule retry/callback/terminal
+        W->>DB: Idempotently record outcome and schedule next action
     end
 ```
 
